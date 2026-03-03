@@ -29,10 +29,13 @@ streamlit
 # LLM / 임베딩 / PEFT
 transformers
 sentence_transformers
+huggingface_hub
 accelerate
 bitsandbytes
 peft
 torch
+datasets
+google-genai
 
 # flash-attn: PyTorch/CUDA 버전 맞춘 뒤 필요 시 별도 설치
 # pip install --no-build-isolation flash-attn

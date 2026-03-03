@@ -148,6 +148,11 @@ class GraphState(TypedDict):
     messages: Annotated[list, add_messages]  # 대화 이력 (누적)
     relevance: Annotated[str, "검색 문서 관련성 yes/no"]
     policy: Annotated[str, "학생에 대한 답안 방향성"]
+    variant: Annotated[str, "평가/실행 변형(B0/B1/B2/P), 기본 P"]
+    forced_style: Annotated[str, "요청 단위 강제 스타일(선택): direct/socratic/scaffolding/feedback"]
+    applied_style: Annotated[str, "이번 응답에 실제 적용된 스타일"]
+    style_source: Annotated[str, "스타일 결정 출처: router | forced | forced_invalid_fallback"]
+    adapter_switched: Annotated[bool, "PEFT set_adapter 적용 성공 여부"]
 
 
 # ============================================================
@@ -825,17 +830,47 @@ def llm_answer(state: GraphState) -> GraphState:
     context = state.get("context", "")
     chat_history = state.get("messages", [])
     policy = state.get("policy", "")
+    variant = (state.get("variant") or "P").strip().upper()
+    forced_style = (state.get("forced_style") or "").strip().lower()
 
-    style = route_style(question)  # centroids → direct/socratic/scaffolding/feedback
-    _log(f"🎯 LoRA 라우팅: {style}")
+    if forced_style:
+        if forced_style in STYLE_MODELS:
+            style = forced_style
+            style_source = "forced"
+            _log(f"🎯 LoRA 강제 스타일: {style}")
+        else:
+            style = "direct"
+            style_source = "forced_invalid_fallback"
+            _log(f"⚠️ 잘못된 forced_style='{forced_style}' → direct 사용")
+    elif variant == "B0":
+        style = "direct"
+        style_source = "variant_b0"
+        _log("🎯 B0: 라우터/어댑터 없이 base path 사용")
+    elif variant == "B2":
+        style = "scaffolding"
+        style_source = "variant_b2"
+        _log("🎯 B2: intermediate/scaffolding 고정")
+    else:
+        style = route_style(question)  # centroids → direct/socratic/scaffolding/feedback
+        style_source = "router"
+        _log(f"🎯 LoRA 라우팅: {style}")
+
+    adapter_switched = False
+    # B0는 어댑터 스위칭을 하지 않음.
     # PEFT 멀티 어댑터일 때만 쿼리별 어댑터 스위칭 (전체 모델 단일 로드 시 무시)
-    if _peft_model is not None:
+    if variant != "B0" and _peft_model is not None:
         try:
             _peft_model.set_adapter(style)
+            adapter_switched = True
         except (ValueError, KeyError) as e:
             _log(f"⚠️ 어댑터 '{style}' 적용 실패 ({e}) → direct 사용")
             style = "direct"
-            _peft_model.set_adapter(style)
+            try:
+                _peft_model.set_adapter(style)
+                adapter_switched = True
+            except Exception as e2:  # noqa: BLE001
+                adapter_switched = False
+                _log(f"❌ direct 어댑터 적용도 실패: {e2}")
 
     history_str = _format_chat_history_for_prompt(chat_history)
     if history_str:
@@ -853,7 +888,10 @@ Policy: {policy}
 <|im_start|>assistant
 """
     try:
-        response = _rag_llm.invoke(prompt).strip()
+        if variant == "B0":
+            response = _invoke_clean(prompt).strip()
+        else:
+            response = _rag_llm.invoke(prompt).strip()
         response = _clean_answer_for_display(response)
     except Exception as e:
         _log(f"❌ 생성 실패: {e}")
@@ -862,6 +900,10 @@ Policy: {policy}
     return GraphState(
         answer=response,
         messages=[("user", question), ("assistant", response)],
+        variant=variant,
+        applied_style=style,
+        style_source=style_source,
+        adapter_switched=adapter_switched,
     )
 
 
@@ -1194,13 +1236,20 @@ def build_app():
 # ============================================================
 
 
-def query(question: str, thread_id: str | None = None) -> Dict[str, Any]:
+def query(
+    question: str,
+    thread_id: str | None = None,
+    forced_style: str | None = None,
+    variant: str | None = None,
+) -> Dict[str, Any]:
     """
     질문을 실행하고 최종 GraphState 를 반환.
 
     Args:
         question:  사용자 질문 문자열
         thread_id: 대화 세션 ID (None 이면 자동 생성)
+        forced_style: 스타일 강제값 (direct/socratic/scaffolding/feedback), None이면 라우터 사용
+        variant: 실행 변형(B0/B1/B2/P), None이면 P
 
     Returns:
         최종 상태 딕셔너리 (question, context, answer, messages, relevance)
@@ -1215,7 +1264,13 @@ def query(question: str, thread_id: str | None = None) -> Dict[str, Any]:
         recursion_limit=10,
         configurable={"thread_id": thread_id},
     )
-    inputs = GraphState(question=question)
+    normalized_style = (forced_style or "").strip().lower() or None
+    normalized_variant = (variant or "P").strip().upper()
+    inputs = GraphState(
+        question=question,
+        forced_style=normalized_style,
+        variant=normalized_variant,
+    )
 
     # stream 모드로 실행 — 각 노드 완료 시 로그
     for event in _app.stream(inputs, config=config):

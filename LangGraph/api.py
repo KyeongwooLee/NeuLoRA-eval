@@ -17,7 +17,7 @@ import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -64,12 +64,18 @@ class ChatRequest(BaseModel):
     #같은 thread_id를 쓰면 이전 대화 내역을 유지하면서 질문 가능
     #{ "message": "그럼 장점은?", "thread_id": "abc-123" }
     thread_id: str | None = None
+    forced_style: str | None = None
+    variant: str | None = None
 
 
 class ChatResponse(BaseModel):
     answer: str
     thread_id: str
     logs: list[str]
+    variant: str | None = None
+    applied_style: str | None = None
+    style_source: str | None = None
+    adapter_switched: bool | None = None
 
 
 class StatusResponse(BaseModel):
@@ -98,15 +104,43 @@ class ResetResponse(BaseModel):
 async def chat(req: ChatRequest):
     """사용자 메시지를 받아 RAG 파이프라인 실행 후 답변 반환"""
     thread_id = req.thread_id or lg.random_uuid()
+    forced_style = (req.forced_style or "").strip().lower() or None
+    variant = (req.variant or "").strip().upper() or None
+    if forced_style and forced_style not in lg.STYLE_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Unsupported forced_style: {forced_style}",
+                "available": list(lg.STYLE_MODELS.keys()),
+            },
+        )
+    if variant and variant not in {"B0", "B1", "B2", "P"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Unsupported variant: {variant}",
+                "available": ["B0", "B1", "B2", "P"],
+            },
+        )
 
     # LLM 호출은 동기 → 별도 스레드에서 실행
-    result = await asyncio.to_thread(lg.query, req.message, thread_id)
+    result = await asyncio.to_thread(
+        lg.query,
+        req.message,
+        thread_id,
+        forced_style,
+        variant,
+    )
     logs = lg.get_and_clear_logs()
 
     return ChatResponse(
         answer=result.get("answer", "답변을 생성하지 못했습니다."),
         thread_id=thread_id,
         logs=logs,
+        variant=result.get("variant"),
+        applied_style=result.get("applied_style"),
+        style_source=result.get("style_source"),
+        adapter_switched=result.get("adapter_switched"),
     )
 
 

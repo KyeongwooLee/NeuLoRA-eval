@@ -19,18 +19,18 @@ cd "$PROJECT_ROOT"
 echo "📁 프로젝트 루트: $PROJECT_ROOT"
 
 # ────────────────────────────────────────────────────────────
-# 0. Python 버전 확인 (3.10+ 권장)
+# 0. Python 버전 확인 (3.10+ 필수: eval 코드의 타입 문법 호환)
 # ────────────────────────────────────────────────────────────
 echo ""
 echo "🐍 [0/7] Python 버전 확인..."
 PYTHON_CMD=""
-for p in python3.10 python3.11 python3; do
+for p in python3.13 python3.12 python3.11 python3.10 python3; do
     if command -v "$p" &>/dev/null; then
         v=$("$p" -c "import sys; print(sys.version_info.major, sys.version_info.minor)" 2>/dev/null) || true
         if [ -n "$v" ]; then
             maj="${v% *}"
             min="${v#* }"
-            if [ "$maj" -ge 3 ] && [ "$min" -ge 8 ]; then
+            if [ "$maj" -gt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -ge 10 ]; }; then
                 PYTHON_CMD="$p"
                 echo "  → 사용: $p ($($p --version 2>&1))"
                 break
@@ -39,7 +39,7 @@ for p in python3.10 python3.11 python3; do
     fi
 done
 if [ -z "$PYTHON_CMD" ]; then
-    echo "  ⚠️ Python 3.8+ 필요. python3.10 또는 python3 설치 후 재실행하세요."
+    echo "  ⚠️ Python 3.10+ 필요. python3.10 이상 설치 후 재실행하세요."
     exit 1
 fi
 
@@ -66,13 +66,31 @@ if [ ! -d "$VENV_DIR" ]; then
     "$PYTHON_CMD" -m venv "$VENV_DIR"
 fi
 
-source "$VENV_DIR/bin/activate"
+VENV_ACTIVATE=""
+VENV_PY=""
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    VENV_ACTIVATE="$VENV_DIR/bin/activate"
+    VENV_PY="$VENV_DIR/bin/python"
+elif [ -f "$VENV_DIR/Scripts/activate" ]; then
+    VENV_ACTIVATE="$VENV_DIR/Scripts/activate"
+    VENV_PY="$VENV_DIR/Scripts/python.exe"
+else
+    echo "  ⚠️ 가상환경 활성화 스크립트를 찾지 못했습니다: $VENV_DIR"
+    exit 1
+fi
+
+source "$VENV_ACTIVATE"
 
 echo "  → pip/setuptools/wheel 업그레이드..."
-pip install --upgrade pip setuptools wheel -q
+"$VENV_PY" -m pip install --upgrade pip setuptools wheel -q
 
 echo "  → requirements.txt 설치 (캐시 미사용으로 깨끗 설치)..."
-pip install --no-cache-dir -r "$PROJECT_ROOT/requirements.txt" -q
+"$VENV_PY" -m pip install --no-cache-dir -r requirements.txt -q
+
+if [ -f "$PROJECT_ROOT/../LPITutor/requirements.txt" ]; then
+    echo "  → LPITutor requirements 설치 (B2 비교용)..."
+    "$VENV_PY" -m pip install --no-cache-dir -r ../LPITutor/requirements.txt -q
+fi
 
 echo "  ✅ Python 패키지 설치 완료"
 
@@ -102,7 +120,7 @@ echo "  → Node $(node -v 2>/dev/null || echo 'n/a'), npm $(npm -v 2>/dev/null 
 # ────────────────────────────────────────────────────────────
 echo ""
 echo "🔗 [4/7] venv activate에 nvm 로드 연결..."
-ACTIVATE_FILE="$VENV_DIR/bin/activate"
+ACTIVATE_FILE="$VENV_ACTIVATE"
 NVM_MARKER="# >>> nvm auto-load >>>"
 if ! grep -q "$NVM_MARKER" "$ACTIVATE_FILE" 2>/dev/null; then
     cat >> "$ACTIVATE_FILE" << 'NVMEOF'
@@ -139,7 +157,7 @@ ENV_FILE="$PROJECT_ROOT/.env"
 ENV_EXAMPLE="$PROJECT_ROOT/.env.example"
 if [ -f "$ENV_FILE" ]; then
     echo "  ✅ .env 존재"
-    for key in HF_API_KEY TAVILY_API_KEY LLM_MODE; do
+    for key in HF_API_KEY GENAI_API_KEY TAVILY_API_KEY LLM_MODE EMBEDDING_MODE; do
         grep -q "^${key}=" "$ENV_FILE" 2>/dev/null && echo "    ✓ $key" || echo "    ✗ $key 미설정"
     done
 else
@@ -160,15 +178,21 @@ fi
 # ────────────────────────────────────────────────────────────
 echo ""
 echo "✔️ [7/7] Python 의존성 검증..."
-if ( cd "$PROJECT_ROOT" && source "$VENV_DIR/bin/activate" && python -c "
+if ( cd "$PROJECT_ROOT" && source "$VENV_ACTIVATE" && "$VENV_PY" -c "
 import sys
 sys.path.insert(0, '.')
 try:
     import rag.base
     import fastapi
     import uvicorn
+    import chromadb
+    import datasets
+    import sentence_transformers
+    import huggingface_hub
+    from google import genai
+    import eval.run_benchmark
     # LangGraph는 api.py 실행 시 LangGraph 디렉터리 기준으로 로드됨
-    print('  → rag, fastapi, uvicorn OK')
+    print('  → backend + eval imports OK')
 except Exception as e:
     print('  ✗ import 실패:', e)
     sys.exit(1)
@@ -187,7 +211,7 @@ echo "🎉 셋업 완료 (원격 재연결 후에도 이 스크립트 재실행 
 echo "=============================================="
 echo ""
 echo "사용법:"
-echo "  1. 가상환경: source $VENV_DIR/bin/activate"
+echo "  1. 가상환경: source $VENV_ACTIVATE"
 echo "  2. 백엔드:   cd $PROJECT_ROOT/LangGraph && uvicorn api:app --reload --port 8800"
 echo "  3. 프론트:   cd $PROJECT_ROOT/LangGraph/frontend && npm run dev"
 echo ""

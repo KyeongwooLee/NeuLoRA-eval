@@ -156,6 +156,37 @@ streamlit run stream.py
 
 ---
 
+## 📊 Benchmark Evaluation (NeuLoRA/eval)
+
+아키텍처 비교(B0/B1/B2/P) 및 어댑터 고정 비교를 실행할 수 있습니다.
+
+```bash
+cd NeuLoRA
+python -m eval.run_benchmark \
+  --mode architecture \
+  --benchmarks comta,mathdial,mtbench,gsm8k \
+  --max-samples 200 \
+  --seed 42 \
+  --judge-model gemini-2.5-flash
+```
+
+어댑터 고정 비교:
+
+```bash
+python -m eval.run_benchmark --mode adapters
+```
+
+필수 환경변수:
+- `HF_API_KEY` (모델 호출)
+- `GENAI_API_KEY` (Gemini judge)
+- 선택: `BASE_MODEL_NAME`, `EMBEDDING_MODEL_NAME`
+
+출력:
+- `eval/outputs/<mode>/<benchmark>__<variant>.json`
+- `eval/outputs/<mode>/summary.json`
+
+---
+
 ## 🤖 모델 설정
 
 - **라우팅/판단/요약**: `Qwen/Qwen2.5-14B-Instruct` (API 또는 vessel)

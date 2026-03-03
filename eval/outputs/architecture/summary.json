@@ -1,0 +1,115 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-03-03T19:08:06.586460+00:00",
+    "mode": "architecture",
+    "benchmarks": [
+      "mathdial",
+      "mtbench",
+      "gsm8k"
+    ],
+    "max_samples": 200,
+    "seed": 42,
+    "judge_model": "gemini-2.5-flash",
+    "base_model_name": "Qwen/Qwen2.5-14B-Instruct",
+    "embedding_model_name": "BAAI/bge-m3",
+    "llm_mode": "api"
+  },
+  "runs": [
+    {
+      "benchmark": "mathdial",
+      "variant": "B0",
+      "benchmark_score": 29.565,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mathdial__B0.json"
+    },
+    {
+      "benchmark": "mathdial",
+      "variant": "B1",
+      "benchmark_score": 19.77,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mathdial__B1.json"
+    },
+    {
+      "benchmark": "mathdial",
+      "variant": "B2",
+      "benchmark_score": 31.06,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mathdial__B2.json"
+    },
+    {
+      "benchmark": "mathdial",
+      "variant": "P",
+      "benchmark_score": 19.8,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mathdial__P.json"
+    },
+    {
+      "benchmark": "mtbench",
+      "variant": "B0",
+      "benchmark_score": 22.062,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mtbench__B0.json"
+    },
+    {
+      "benchmark": "mtbench",
+      "variant": "B1",
+      "benchmark_score": 36.125,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mtbench__B1.json"
+    },
+    {
+      "benchmark": "mtbench",
+      "variant": "B2",
+      "benchmark_score": 19.312,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mtbench__B2.json"
+    },
+    {
+      "benchmark": "mtbench",
+      "variant": "P",
+      "benchmark_score": 38.188,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\mtbench__P.json"
+    },
+    {
+      "benchmark": "gsm8k",
+      "variant": "B0",
+      "benchmark_score": 82.0,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\gsm8k__B0.json"
+    },
+    {
+      "benchmark": "gsm8k",
+      "variant": "B1",
+      "benchmark_score": 0.0,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\gsm8k__B1.json"
+    },
+    {
+      "benchmark": "gsm8k",
+      "variant": "B2",
+      "benchmark_score": 6.5,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\gsm8k__B2.json"
+    },
+    {
+      "benchmark": "gsm8k",
+      "variant": "P",
+      "benchmark_score": 0.0,
+      "path": "C:\\Users\\zldwk\\OneDrive\\Desktop\\NLP_Project\\NeuLoRA\\eval\\outputs\\architecture\\gsm8k__P.json"
+    }
+  ],
+  "macro_by_variant": {
+    "B0": 44.542,
+    "B1": 18.632,
+    "B2": 18.957,
+    "P": 19.329
+  },
+  "comparison_table": [
+    {
+      "variant": "B0",
+      "macro_average_score": 44.542
+    },
+    {
+      "variant": "P",
+      "macro_average_score": 19.329
+    },
+    {
+      "variant": "B2",
+      "macro_average_score": 18.957
+    },
+    {
+      "variant": "B1",
+      "macro_average_score": 18.632
+    }
+  ]
+}
