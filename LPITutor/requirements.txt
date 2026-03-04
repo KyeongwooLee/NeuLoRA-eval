@@ -1,0 +1,5 @@
+pdfplumber
+chromadb
+sentence-transformers
+huggingface_hub
+nltk
