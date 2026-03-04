@@ -111,6 +111,8 @@ ROUTER_MODEL = os.getenv("ROUTER_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")  # 라
 CHAIN_MODEL = os.getenv("CHAIN_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")  # 답변 생성용 (rag.base)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")  # 임베딩 모델
 HF_PROVIDER = (os.getenv("HF_PROVIDER") or "auto").strip().lower() or "auto"
+B0_MODEL = os.getenv("B0_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
+B0_MAX_NEW_TOKENS = 384
 
 STYLE_MODELS = {
     "direct": "RiverWon/NeuLoRA-direct",
@@ -190,6 +192,7 @@ _use_peft_adapters = False  # True: set_adapter() 사용 / False: 단일 전체 
 _retriever = None  # ChromaDB 기반 retriever
 _chain = None  # RAG 답변 체인
 _chat_hf = None  # 라우팅·판단·요약용 LLM
+_chat_hf_b0 = None  # B0 답변 생성용 LLM (14B, no adapter)
 _embeddings = None  # 임베딩 모델 인스턴스
 _app = None  # 컴파일된 LangGraph 앱
 _initialized = False  # 초기화 완료 플래그
@@ -214,7 +217,7 @@ def _init_hf_login():
         _log("⚠️ HF_API_KEY 가 설정되지 않았습니다")
 
 
-def _make_vessel_chat_model():
+def _make_vessel_chat_model(model_name: str, max_new_tokens: int = 1024):
     """
     vessel(로컬 GPU)용 LLM 생성.
     transformers 파이프라인 → LangChain 호환 래퍼(.invoke() 반환값에 .content 있음).
@@ -237,14 +240,14 @@ def _make_vessel_chat_model():
         model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         _log("⚖️ 답변 LLM 8bit 양자화 사용")
 
-    model = AutoModelForCausalLM.from_pretrained(ROUTER_MODEL, **model_kwargs)
-    tokenizer = AutoTokenizer.from_pretrained(ROUTER_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=1024,
+        max_new_tokens=max_new_tokens,
         temperature=0.7,
         do_sample=True,
     )
@@ -257,13 +260,15 @@ def _make_vessel_chat_model():
 
 def _init_chat_model():
     """라우팅·판단·요약용 LLM 초기화. LLM_MODE=vessel 이면 로컬 GPU, 아니면 API."""
-    global _chat_hf
+    global _chat_hf, _chat_hf_b0
 
     mode = (os.getenv("LLM_MODE") or "api").strip().lower()
 
     if mode == "vessel":
-        _chat_hf = _make_vessel_chat_model()
+        _chat_hf = _make_vessel_chat_model(ROUTER_MODEL, max_new_tokens=1024)
+        _chat_hf_b0 = _make_vessel_chat_model(B0_MODEL, max_new_tokens=B0_MAX_NEW_TOKENS)
         _log(f"✅ 라우팅 LLM 로드 완료 (vessel 로컬): {ROUTER_MODEL}")
+        _log(f"✅ B0 답변 LLM 로드 완료 (vessel 로컬): {B0_MODEL}")
     else:
         llm = HuggingFaceEndpoint(
             repo_id=ROUTER_MODEL,
@@ -274,6 +279,15 @@ def _init_chat_model():
         )
         _chat_hf = ChatHuggingFace(llm=llm)
         _log(f"✅ 라우팅 LLM 로드 완료 (API): {ROUTER_MODEL} [provider={HF_PROVIDER}]")
+        b0_llm = HuggingFaceEndpoint(
+            repo_id=B0_MODEL,
+            provider=HF_PROVIDER,
+            task="text-generation",
+            temperature=0.7,
+            max_new_tokens=B0_MAX_NEW_TOKENS,
+        )
+        _chat_hf_b0 = ChatHuggingFace(llm=b0_llm)
+        _log(f"✅ B0 답변 LLM 로드 완료 (API): {B0_MODEL} [provider={HF_PROVIDER}]")
 
 
 def _init_embeddings():
@@ -286,7 +300,7 @@ def _init_embeddings():
 def _init_rag_chain(
     persist_directory: str = PERSIST_DIR,
     collection_name: str = COLLECTION_MAIN,
-    k: int = 10,
+    k: int = 5,
 ):
     """ChromaDB 기반 RAG 체인 (retriever + chain) 초기화"""
     global _retriever, _chain, _answer_model_used
@@ -480,7 +494,7 @@ def route_style(question: str) -> str:
 def initialize(
     persist_directory: str = PERSIST_DIR,
     collection_name: str = COLLECTION_MAIN,
-    k: int = 10,
+    k: int = 5,
 ):
     """
     전체 파이프라인 초기화 — 최초 1 회만 실행.
@@ -657,9 +671,10 @@ def _clean_answer_for_display(raw: str) -> str:
     return text
 
 
-def _invoke_clean(prompt) -> str:
+def _invoke_clean(prompt, chat_model=None) -> str:
     """_chat_hf.invoke() 호출 후 특수 토큰/시스템 프롬프트를 제거한 순수 텍스트 반환"""
-    resp = _chat_hf.invoke(prompt)
+    model = chat_model or _chat_hf
+    resp = model.invoke(prompt)
     raw = resp.content if hasattr(resp, "content") else str(resp)
     return _strip_chat_tokens(raw)
 
@@ -668,8 +683,8 @@ def _summarize_if_long(content: str, max_chars: int = MAX_CHARS_PER_DOC) -> str:
     if len(content) <= max_chars:
         return content
     prompt = (
-        f"아래 텍스트를 핵심만 남겨 {max_chars}자 이내로 요약해주세요. "
-        f"한글로 작성하고 불필요한 반복은 제거하세요. 요약만 출력.\n\n"
+        f"Summarize the text below to keep only the key points within {max_chars} characters. "
+        f"Preserve the input text language, remove unnecessary repetition, and output only the summary.\n\n"
         f"---\n{content[:8000]}\n---"
     )
     try:
@@ -732,8 +747,8 @@ def contextualize(state: GraphState) -> GraphState:
     ambiguous_recall = _looks_ambiguous(question)
 
     llm_recall = False
-    judge_prompt = f"""당신은 질의 라우팅 판별기입니다.
-아래 사용자 질문이 과거 대화 맥락(특히 개인 정보/이전 대화 요약) 없이는 해석이 어려운지 판단하세요.
+    judge_prompt = f"""You are a query-routing classifier.
+Determine whether the user question below is difficult to interpret without past conversation context (especially personal information / previous conversation summaries).
 
 [Recent Chat]
 {recent_chat}
@@ -741,7 +756,7 @@ def contextualize(state: GraphState) -> GraphState:
 [Question]
 {question}
 
-출력은 반드시 아래 둘 중 하나만:
+The output must be exactly one of the two below:
 YES
 NO""".strip()
 
@@ -766,11 +781,11 @@ NO""".strip()
         )
 
         # 검색 친화적 쿼리 생성
-        rq_prompt = f"""사용자 질문으로 벡터 검색할 쿼리를 1 문장으로 만들어주세요.
-- 과거 대화에서 찾아야 할 핵심 엔티티를 포함하세요.
-- 불필요한 수식어 없이 검색 친화적으로 작성하세요.
-- 질문에 답하지 말고 검색 쿼리 문장만 출력하세요.
-- 출력 언어는 원문 질문의 언어를 유지하세요.
+        rq_prompt = f"""Create a one-sentence query for vector retrieval from the user question.
+- Include key entities that should be found in past conversation.
+- Write it in a retrieval-friendly way without unnecessary modifiers.
+- Do not answer the question; output only the retrieval query sentence.
+- Keep the output language the same as the original question.
 
 [Recent Chat]
 {recent_chat}
@@ -920,10 +935,10 @@ Policy: {policy}
 <|im_start|>user
 {question}<|im_end|>
 <|im_start|>assistant
-"""
+    """
     try:
         if variant == "B0":
-            response = _invoke_clean(prompt).strip()
+            response = _invoke_clean(prompt, chat_model=_chat_hf_b0 or _chat_hf).strip()
         else:
             response = _rag_llm.invoke(prompt).strip()
         response = _clean_answer_for_display(response)
@@ -1112,24 +1127,24 @@ def save_memory(state: GraphState) -> GraphState:
     recent = conv[-20:]  # 최근 10턴
     conv_text = "\n".join(f"{r}: {c}" for r, c in recent).strip()
 
-    policy_prompt = f"""당신은 학습 튜터의 교육 전략 분석가입니다.
-아래 학생과 튜터의 최근 대화 내용을 분석하여, 앞으로 10턴 동안 튜터가 취해야 할 답변 방향성(policy)을 결정하세요.
+    policy_prompt = f"""You are an instructional strategy analyst for a learning tutor.
+Analyze the recent conversation between the student and tutor below, and determine the response direction (policy) the tutor should take for the next 10 turns.
 
-[최근 대화 내용]
+[Recent Conversation]
 {conv_text}
 
-아래 보기 중에서 학생에게 가장 적합한 방향성을 1~2개 선택하고, 해당 형식 그대로 출력하세요.
-여러 개 선택 시 줄바꿈으로 구분합니다.
+From the options below, choose 1 to 2 directions that best fit the student, and output them in exactly the same format.
+If you choose multiple, separate them with line breaks.
 
-- 개념 이해 부족 -> 예시를 통한 개념 설명
-- 응용능력 부족 -> 유사 문제 추천
-- 암기 능력 강화 -> 앞글자를 따 암기방식 추천
-- 개념 간 연결 부족 -> 연관 개념 및 비교 설명
-- 자주 틀리는 유형 -> 오답 분석 및 반복 학습 유도
-- 심화 학습 필요 -> 난이도 높은 질문 유도
-- 기초 부족 -> 선수 개념부터 단계적 설명
+- Insufficient conceptual understanding -> Explain concepts through examples
+- Insufficient application ability -> Recommend similar problems
+- Strengthen memorization ability -> Recommend an initial-letter mnemonic method
+- Insufficient connections between concepts -> Explain related concepts and comparisons
+- Frequently mistaken patterns -> Analyze wrong answers and encourage repetitive practice
+- Need for advanced learning -> Encourage higher-difficulty questions
+- Insufficient fundamentals -> Provide step-by-step explanations starting from prerequisite concepts
 
-방향성만 출력하세요. 다른 설명은 불필요합니다.""".strip()
+Output only the direction(s). No other explanation is needed.""".strip()
 
     try:
         policy_text = _invoke_clean(policy_prompt)
@@ -1163,17 +1178,17 @@ def retrieve_or_not(state: GraphState) -> str:
     if not question:
         return "not retrieve"
 
-    prompt = f"""다음 사용자 질문에 답하려면 **문서/벡터DB 검색(retrieve)**이 필요한지 판단하세요.
+    prompt = f"""Determine whether **document/vector DB retrieval** is needed to answer the following user question.
 
-판단 기준:
-- 인사, 감정, 단순 대화("안녕", "고마워", "뭐해" 등), 잡담 → 검색 불필요
-- 문서에 있을 법한 전문 지식 질문 → 검색 필요
-- 최신 정보/뉴스 → 검색 필요
+Decision criteria:
+- Greetings, emotions, simple conversation ("hi", "thanks", "what are you doing", etc.), or small talk -> retrieval not needed
+- Expert knowledge questions likely to be in documents -> retrieval needed
+- Latest information/news -> retrieval needed
 
-질문: {question}
+Question: {question}
 
-*반드시 아래 JSON 형식으로만 답하세요. 다른 텍스트 없이 JSON 만 출력.
-{{"need_retrieve": "yes"}} 또는 {{"need_retrieve": "no"}}""".strip()
+*You must answer only in the JSON format below. Output JSON only, with no other text.
+{{"need_retrieve": "yes"}} or {{"need_retrieve": "no"}}""".strip()
 
     try:
         text = _invoke_clean(prompt)

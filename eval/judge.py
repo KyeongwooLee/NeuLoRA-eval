@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
+import time
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from statistics import mean
 from typing import Any
@@ -10,22 +14,22 @@ from typing import Any
 TUTORING_CRITERIA: list[dict[str, Any]] = [
     {
         "name": "reference_correctness",
-        "description": "Reference answer와의 개념/논리 일치도",
+        "description": "Conceptual/logical alignment with the reference answer",
         "weight": 0.45,
     },
     {
         "name": "pedagogical_quality",
-        "description": "튜터링 품질(유도, 힌트, 구조화) 및 학습 지원성",
+        "description": "Tutoring quality (guidance, hints, structure) and learning support",
         "weight": 0.25,
     },
     {
         "name": "clarity",
-        "description": "설명의 명확성, 단계성, 표현의 이해 용이성",
+        "description": "Clarity of explanation, stepwise progression, and ease of understanding",
         "weight": 0.20,
     },
     {
         "name": "safety_hallucination_control",
-        "description": "과장/환각/무근거 내용 억제",
+        "description": "Suppression of exaggeration, hallucination, and unsupported claims",
         "weight": 0.10,
     },
 ]
@@ -48,6 +52,13 @@ class GeminiJudge:
         self.model_name = model_name
         self._client = genai.Client(api_key=api_key)
         self._types = types
+        self._min_interval_sec = 0.5
+        self._rate_lock = threading.Lock()
+        self._next_allowed_at = 0.0
+        self._max_retries = 6
+        self._backoff_base_sec = 1.0
+        self._backoff_cap_sec = 30.0
+        self._jitter_max_sec = 0.3
 
     @staticmethod
     def _json_loads_safe(text: str) -> dict[str, Any]:
@@ -68,17 +79,122 @@ class GeminiJudge:
         except Exception:
             return {}
 
-    def _generate_json(self, prompt: str) -> dict[str, Any]:
-        response = self._client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=self._types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0,
-                thinking_config=self._types.ThinkingConfig(thinking_budget=0),
-            ),
+    def _wait_rate_limit_slot(self) -> None:
+        sleep_sec = 0.0
+        with self._rate_lock:
+            now = time.monotonic()
+            if now < self._next_allowed_at:
+                sleep_sec = self._next_allowed_at - now
+            slot_start = max(now, self._next_allowed_at)
+            self._next_allowed_at = slot_start + self._min_interval_sec
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+    @staticmethod
+    def _extract_status_code(exc: Exception) -> int | None:
+        for attr in ("status_code", "code", "status"):
+            value = getattr(exc, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            for attr in ("status_code", "status", "code"):
+                value = getattr(response, attr, None)
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
+        return None
+
+    @staticmethod
+    def _extract_retry_after_seconds(exc: Exception) -> float | None:
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except Exception:
+                pass
+
+        headers = getattr(exc, "headers", None)
+        if headers is None:
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None) if response is not None else None
+        if not headers:
+            return None
+
+        raw = None
+        if hasattr(headers, "get"):
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+        elif isinstance(headers, dict):
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+
+        if not raw:
+            return None
+
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            pass
+
+        try:
+            dt = parsedate_to_datetime(str(raw))
+            if dt is None:
+                return None
+            now = time.time()
+            return max(0.0, dt.timestamp() - now)
+        except Exception:
+            return None
+
+    def _is_retryable(self, exc: Exception) -> bool:
+        code = self._extract_status_code(exc)
+        if code in {429, 500, 502, 503, 504}:
+            return True
+
+        msg = str(exc).lower()
+        retry_signals = (
+            "too many requests",
+            "rate limit",
+            "resource has been exhausted",
+            "temporarily unavailable",
+            "service unavailable",
+            "deadline exceeded",
+            "timed out",
+            "timeout",
+            "connection reset",
         )
-        return self._json_loads_safe(response.text or "{}")
+        return any(signal in msg for signal in retry_signals)
+
+    def _generate_json(self, prompt: str) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            self._wait_rate_limit_slot()
+            try:
+                response = self._client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=self._types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                        thinking_config=self._types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                return self._json_loads_safe(response.text or "{}")
+            except Exception as exc:
+                last_error = exc
+                if not self._is_retryable(exc) or attempt >= self._max_retries:
+                    raise
+
+                retry_after = self._extract_retry_after_seconds(exc) or 0.0
+                backoff = min(self._backoff_cap_sec, self._backoff_base_sec * (2 ** attempt))
+                jitter = random.uniform(0.0, self._jitter_max_sec)
+                time.sleep(max(retry_after, backoff + jitter))
+
+        if last_error is not None:
+            raise last_error
+        return {}
 
     def score_tutoring_turn(
         self,

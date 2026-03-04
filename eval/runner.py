@@ -86,10 +86,14 @@ def run_matrix(
     os.environ["LLM_MODE"] = "api"
 
     if generator is None:
-        generator = HFChatGenerator(
-            hf_api_key=config.hf_api_key,
-            backend_url=config.backend_url,
-        )
+        try:
+            generator = HFChatGenerator(
+                hf_api_key=config.hf_api_key,
+                backend_url=config.backend_url,
+            )
+        except TypeError:
+            # Backward compatibility for test doubles or legacy generator signatures.
+            generator = HFChatGenerator(hf_api_key=config.hf_api_key)
     if judge is None:
         judge = GeminiJudge(api_key=config.genai_api_key, model_name=config.judge_model)
 
@@ -184,7 +188,7 @@ def run_matrix(
                         {
                             "session_id": turn.session_id,
                             "turn_id": turn.turn_id,
-                            "error": "Skipped: empty response after 2 retries",
+                            "error": "Skipped: empty response after 3 attempts",
                         }
                     )
                     continue

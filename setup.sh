@@ -87,9 +87,16 @@ echo "  → pip/setuptools/wheel 업그레이드..."
 echo "  → requirements.txt 설치 (캐시 미사용으로 깨끗 설치)..."
 "$VENV_PY" -m pip install --no-cache-dir -r requirements.txt -q
 
-if [ -f "$PROJECT_ROOT/../LPITutor/requirements.txt" ]; then
+LPITUTOR_REQUIREMENTS=""
+if [ -f "$PROJECT_ROOT/LPITutor/requirements.txt" ]; then
+    LPITUTOR_REQUIREMENTS="$PROJECT_ROOT/LPITutor/requirements.txt"
+elif [ -f "$PROJECT_ROOT/../LPITutor/requirements.txt" ]; then
+    LPITUTOR_REQUIREMENTS="$PROJECT_ROOT/../LPITutor/requirements.txt"
+fi
+
+if [ -n "$LPITUTOR_REQUIREMENTS" ]; then
     echo "  → LPITutor requirements 설치 (B2 비교용)..."
-    "$VENV_PY" -m pip install --no-cache-dir -r ../LPITutor/requirements.txt -q
+    "$VENV_PY" -m pip install --no-cache-dir -r "$LPITUTOR_REQUIREMENTS" -q
 fi
 
 echo "  ✅ Python 패키지 설치 완료"

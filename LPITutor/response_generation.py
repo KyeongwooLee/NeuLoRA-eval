@@ -71,7 +71,7 @@ class ResponseGenerator:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=256,
+            max_tokens=384,
             temperature=0.2,
         )
         return (response.choices[0].message.content or "").strip()

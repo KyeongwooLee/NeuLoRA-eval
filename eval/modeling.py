@@ -7,6 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 from .common import STYLE_MODELS, EvalConfig, EvalTurn, summarize_history
 from .retrieval import StyleRouter
@@ -51,14 +52,10 @@ class HFChatGenerator:
     def generate(
         self,
         *,
-        model_id: str,
-        system_prompt: str,
         user_prompt: str,
-        history: list[tuple[str, str]],
         thread_id: str,
         forced_style: str | None = None,
         variant: str | None = None,
-        max_tokens: int = 256,
     ) -> str:
         endpoint = f"{self.backend_url}/api/chat"
         payload = {
@@ -101,19 +98,37 @@ class VariantExecutor:
         self.router = router
         self.seed = seed
         self.random = random.Random(seed)
+        self.b0_b2_model_name = os.getenv("CHAIN_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
         self._lpitutor = self._load_lpitutor()
 
     def _load_lpitutor(self):
-        lpi_root = self.config.project_root.parent / "LPITutor"
-        if not lpi_root.exists():
+        candidates: list[Path] = []
+        env_root = (os.getenv("LPITUTOR_ROOT") or "").strip()
+        if env_root:
+            candidates.append(Path(env_root).expanduser())
+        candidates.extend(
+            [
+                self.config.project_root / "LPITutor",
+                self.config.project_root.parent / "LPITutor",
+            ]
+        )
+
+        lpi_root = None
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            if (candidate / "response_generation.py").exists():
+                lpi_root = candidate
+                break
+        if lpi_root is None:
             return None
+
         if str(lpi_root) not in sys.path:
             sys.path.insert(0, str(lpi_root))
         try:
             from response_generation import ResponseGenerator as LPITutorResponseGenerator
 
             return LPITutorResponseGenerator(
-                model_name=self.config.base_model_name,
+                model_name=self.b0_b2_model_name,
                 embedding_model_name=self.config.embedding_model_name,
                 hf_api_key=self.config.hf_api_key,
                 hf_provider=os.getenv("HF_PROVIDER", "auto"),
@@ -124,7 +139,7 @@ class VariantExecutor:
     def _build_user_prompt(self, turn: EvalTurn) -> str:
         rules = ["Respond in English only."]
         if turn.benchmark == "gsm8k":
-            rules.append("For GSM8K, end with: Final Answer: <number>.")
+            rules.append("For GSM8K, must end with: Final Answer: <number>.")
         rule_text = " ".join(rules)
         return f"{turn.prompt}\n\n{rule_text}"
 
@@ -157,18 +172,15 @@ class VariantExecutor:
         api_variant = variant
 
         if variant == "B0":
-            model_id = self.config.base_model_name
+            model_id = self.b0_b2_model_name
             style = None
-            system_prompt = self._build_system_prompt(style)
         elif variant == "B1":
             style = self._deterministic_random_style(turn.session_id, turn.turn_id)
             model_id = STYLE_MODELS[style]
-            system_prompt = self._build_system_prompt(style)
             api_forced_style = style
         elif variant == "B2":
             style = "intermediate"
-            model_id = self.config.base_model_name
-            system_prompt = self._build_system_prompt("scaffolding", level="intermediate")
+            model_id = self.b0_b2_model_name
             if self._lpitutor is None:
                 return GenerationResult(
                     response="",
@@ -198,13 +210,9 @@ class VariantExecutor:
                     retrieval_hits=len(retrieved_docs),
                 )
             except Exception as error:
-                full_history = list(turn.history) + list(generated_history)
                 try:
                     fallback_response = self.generator.generate(
-                        model_id=model_id,
-                        system_prompt=system_prompt,
                         user_prompt=user_prompt,
-                        history=full_history,
                         thread_id=api_thread_id,
                         forced_style="scaffolding",
                         variant="B2",
@@ -227,18 +235,13 @@ class VariantExecutor:
         elif variant == "P":
             style, _ = self.router.route(turn.prompt)
             model_id = STYLE_MODELS.get(style, STYLE_MODELS["direct"])
-            system_prompt = self._build_system_prompt(style)
             api_variant = "P"
         else:
             raise ValueError(f"Unsupported architecture variant: {variant}")
 
-        full_history = list(turn.history) + list(generated_history)
         try:
             response = self.generator.generate(
-                model_id=model_id,
-                system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                history=full_history,
                 thread_id=api_thread_id,
                 forced_style=api_forced_style,
                 variant=api_variant,
@@ -271,14 +274,10 @@ class VariantExecutor:
         model_id = STYLE_MODELS[adapter_style]
         api_thread_id = f"eval-adapter-{adapter_style}-{turn.benchmark}-{turn.session_id}"
         user_prompt = self._build_user_prompt(turn)
-        full_history = list(turn.history) + list(generated_history)
 
         try:
             response = self.generator.generate(
-                model_id=model_id,
-                system_prompt=self._build_system_prompt(adapter_style),
                 user_prompt=user_prompt,
-                history=full_history,
                 thread_id=api_thread_id,
                 forced_style=adapter_style,
                 variant="P",

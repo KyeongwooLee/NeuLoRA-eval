@@ -32,7 +32,7 @@ class ChromaRetrievalChain(RetrievalChain):
         self,
         persist_directory: str = "./chroma_db",
         collection_name: str = "default",
-        k: int = 10,
+        k: int = 5,
         model_name: str | None = None,
         external_model=None,
     ):
