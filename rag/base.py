@@ -118,11 +118,15 @@ class RetrievalChain(ABC):
         )
         return dense_retriever
 
-    def create_model(self):
+    def create_model(self, model_name: str | None = None, external_model=None):
         """
         LLM 모델 생성
         - HuggingFaceEndpoint 기반 Qwen/Qwen2.5-14B-Instruct 사용
         """
+        if external_model is not None:
+            return external_model
+
+        target_model = model_name or ANSWER_MODEL
 
         mode = os.getenv("LLM_MODE", "").lower()
         if mode == "vessel":
@@ -143,8 +147,8 @@ class RetrievalChain(ABC):
                 )
             elif q8:
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True) # 3090 24GB 등에서 VRAM 절약
-            model = AutoModelForCausalLM.from_pretrained(ANSWER_MODEL, **model_kwargs)
-            tokenizer = AutoTokenizer.from_pretrained(ANSWER_MODEL)
+            model = AutoModelForCausalLM.from_pretrained(target_model, **model_kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(target_model)
 
             pipe = pipeline(
                     model=model,
@@ -163,7 +167,7 @@ class RetrievalChain(ABC):
             raise ValueError("HF_API_KEY 환경 변수가 설정되지 않았습니다.")
 
         llm = HuggingFaceEndpoint(
-            repo_id=ANSWER_MODEL,
+            repo_id=target_model,
             task="text-generation",
             max_new_tokens=1024,
             temperature=0.7,

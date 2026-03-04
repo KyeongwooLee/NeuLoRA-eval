@@ -51,7 +51,7 @@ class EvalConfig:
         default_factory=lambda: Path(__file__).resolve().parent.parent
     )
     base_model_name: str = field(
-        default_factory=lambda: os.getenv("BASE_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
+        default_factory=lambda: os.getenv("BASE_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
     )
     embedding_model_name: str = field(
         default_factory=lambda: os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")

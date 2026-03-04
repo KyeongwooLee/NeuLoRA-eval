@@ -96,7 +96,6 @@ class ChromaRetrievalChain(RetrievalChain):
                 "context": itemgetter("context"),
                 "chat_history": itemgetter("chat_history"),
                 "policy": itemgetter("policy"),
-                "style_instruction": itemgetter("style_instruction"),
             }
             | prompt
             | model

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 import urllib.error
@@ -29,11 +30,21 @@ class GenerationResult:
 
 
 class HFChatGenerator:
-    def __init__(self, hf_api_key: str, *, backend_url: str, timeout: float = 120.0):
+    def __init__(
+        self,
+        hf_api_key: str,
+        *,
+        backend_url: str,
+        timeout: float = 120.0,
+        disable_web_search: bool = True,
+        disable_relevance_check: bool = True,
+    ):
         # keep `hf_api_key` arg for backward compatibility with existing runner wiring.
         self.hf_api_key = hf_api_key
         self.backend_url = backend_url.rstrip("/")
         self.timeout = timeout
+        self.disable_web_search = disable_web_search
+        self.disable_relevance_check = disable_relevance_check
         if not self.backend_url:
             raise RuntimeError("backend_url is required for /api/chat generation.")
 
@@ -55,6 +66,8 @@ class HFChatGenerator:
             "thread_id": thread_id,
             "forced_style": forced_style,
             "variant": variant,
+            "disable_web_search": self.disable_web_search,
+            "disable_relevance_check": self.disable_relevance_check,
         }
         req = urllib.request.Request(
             endpoint,
@@ -103,21 +116,16 @@ class VariantExecutor:
                 model_name=self.config.base_model_name,
                 embedding_model_name=self.config.embedding_model_name,
                 hf_api_key=self.config.hf_api_key,
+                hf_provider=os.getenv("HF_PROVIDER", "auto"),
             )
         except Exception:
             return None
 
-    def _build_user_prompt(self, turn: EvalTurn, retrieved_context: str) -> str:
+    def _build_user_prompt(self, turn: EvalTurn) -> str:
         rules = ["Respond in English only."]
         if turn.benchmark == "gsm8k":
             rules.append("For GSM8K, end with: Final Answer: <number>.")
         rule_text = " ".join(rules)
-        if retrieved_context:
-            return (
-                f"[Retrieved Context]\n{retrieved_context}\n\n"
-                f"[Student Turn]\n{turn.prompt}\n\n"
-                f"{rule_text}"
-            )
         return f"{turn.prompt}\n\n{rule_text}"
 
     def _build_system_prompt(self, style: str | None, *, level: str | None = None) -> str:
@@ -142,8 +150,7 @@ class VariantExecutor:
         generated_history: list[tuple[str, str]],
         retrieved_docs: list[dict],
     ) -> GenerationResult:
-        context = "\n\n".join(doc.get("text", "") for doc in retrieved_docs[:5]).strip()
-        user_prompt = self._build_user_prompt(turn, context)
+        user_prompt = self._build_user_prompt(turn)
 
         api_thread_id = f"eval-{variant}-{turn.benchmark}-{turn.session_id}"
         api_forced_style: str | None = None
@@ -191,13 +198,32 @@ class VariantExecutor:
                     retrieval_hits=len(retrieved_docs),
                 )
             except Exception as error:
-                return GenerationResult(
-                    response="",
-                    model_id=model_id,
-                    style=style,
-                    retrieval_hits=len(retrieved_docs),
-                    error=f"LPITutor path failed: {error}",
-                )
+                full_history = list(turn.history) + list(generated_history)
+                try:
+                    fallback_response = self.generator.generate(
+                        model_id=model_id,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        history=full_history,
+                        thread_id=api_thread_id,
+                        forced_style="scaffolding",
+                        variant="B2",
+                    )
+                    return GenerationResult(
+                        response=(fallback_response or "").strip(),
+                        model_id=model_id,
+                        style=style,
+                        retrieval_hits=len(retrieved_docs),
+                        error=f"LPITutor path failed: {error} (fallback=/api/chat 사용)",
+                    )
+                except Exception as fallback_error:
+                    return GenerationResult(
+                        response="",
+                        model_id=model_id,
+                        style=style,
+                        retrieval_hits=len(retrieved_docs),
+                        error=f"LPITutor path failed: {error}; fallback failed: {fallback_error}",
+                    )
         elif variant == "P":
             style, _ = self.router.route(turn.prompt)
             model_id = STYLE_MODELS.get(style, STYLE_MODELS["direct"])
@@ -244,8 +270,7 @@ class VariantExecutor:
 
         model_id = STYLE_MODELS[adapter_style]
         api_thread_id = f"eval-adapter-{adapter_style}-{turn.benchmark}-{turn.session_id}"
-        context = "\n\n".join(doc.get("text", "") for doc in retrieved_docs[:5]).strip()
-        user_prompt = self._build_user_prompt(turn, context)
+        user_prompt = self._build_user_prompt(turn)
         full_history = list(turn.history) + list(generated_history)
 
         try:

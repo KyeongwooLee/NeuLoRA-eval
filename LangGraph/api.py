@@ -66,6 +66,8 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     forced_style: str | None = None
     variant: str | None = None
+    disable_web_search: bool | None = None
+    disable_relevance_check: bool | None = None
 
 
 class ChatResponse(BaseModel):
@@ -124,14 +126,26 @@ async def chat(req: ChatRequest):
         )
 
     # LLM 호출은 동기 → 별도 스레드에서 실행
-    result = await asyncio.to_thread(
-        lg.query,
-        req.message,
-        thread_id,
-        forced_style,
-        variant,
-    )
-    logs = lg.get_and_clear_logs()
+    try:
+        result = await asyncio.to_thread(
+            lg.query,
+            req.message,
+            thread_id,
+            forced_style,
+            variant,
+            req.disable_web_search,
+            req.disable_relevance_check,
+        )
+        logs = lg.get_and_clear_logs()
+    except Exception as e:
+        logs = lg.get_and_clear_logs()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": str(e),
+                "logs": logs[-30:],
+            },
+        ) from e
 
     return ChatResponse(
         answer=result.get("answer", "답변을 생성하지 못했습니다."),

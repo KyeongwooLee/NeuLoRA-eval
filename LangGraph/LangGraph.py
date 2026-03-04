@@ -52,6 +52,28 @@ from dotenv import load_dotenv
 
 load_dotenv()  # .env 파일에서 HF_API_KEY, TAVILY_API_KEY 등 로드
 
+# /root FS inode/공간 이슈 회피를 위해 HF 캐시는 /tmp를 기본 사용.
+# 필요 시 .env 의 HF_HOME/HUGGINGFACE_HUB_CACHE/TRANSFORMERS_CACHE로 덮어쓸 수 있다.
+_hf_cache_root = os.getenv("HF_HOME") or "/tmp/hf-cache"
+os.environ.setdefault("HF_HOME", _hf_cache_root)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(_hf_cache_root) / "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(_hf_cache_root) / "transformers"))
+os.environ.setdefault("HF_DATASETS_CACHE", str(Path(_hf_cache_root) / "datasets"))
+for _p in (
+    os.environ["HF_HOME"],
+    os.environ["HUGGINGFACE_HUB_CACHE"],
+    os.environ["TRANSFORMERS_CACHE"],
+    os.environ["HF_DATASETS_CACHE"],
+):
+    Path(_p).mkdir(parents=True, exist_ok=True)
+
+# huggingface_hub 1.x 기본 Xet 경로는 환경에 따라
+# "File Reconstruction Error: receiver dropped"를 유발할 수 있다.
+# 필요 시 .env 에서 HF_HUB_DISABLE_XET=0 으로 다시 켤 수 있다.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
 # ============================================================
 # 2. 로그 수집기
 #    - 노드 내부 print 대신 _log() 사용
@@ -85,9 +107,10 @@ COLLECTION_CHAT_SUMMARY = "chat_history_summarized"  # 대화 요약 저장
 # ROUTER_MODEL = "meta-llama/Llama-3.1-8B-Instruct"  # 라우팅·판단·요약용
 # CHAIN_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"  # 답변 생성용 (rag.base)
 
-ROUTER_MODEL = "Qwen/Qwen2.5-14B-Instruct"  # 라우팅·판단·요약용
-CHAIN_MODEL = "Qwen/Qwen2.5-14B-Instruct"  # 답변 생성용 (rag.base)
-EMBEDDING_MODEL = "BAAI/bge-m3"  # 임베딩 모델
+ROUTER_MODEL = os.getenv("ROUTER_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")  # 라우팅·판단·요약용(API 권장)
+CHAIN_MODEL = os.getenv("CHAIN_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")  # 답변 생성용 (rag.base)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")  # 임베딩 모델
+HF_PROVIDER = (os.getenv("HF_PROVIDER") or "auto").strip().lower() or "auto"
 
 STYLE_MODELS = {
     "direct": "RiverWon/NeuLoRA-direct",
@@ -153,6 +176,8 @@ class GraphState(TypedDict):
     applied_style: Annotated[str, "이번 응답에 실제 적용된 스타일"]
     style_source: Annotated[str, "스타일 결정 출처: router | forced | forced_invalid_fallback"]
     adapter_switched: Annotated[bool, "PEFT set_adapter 적용 성공 여부"]
+    disable_web_search: Annotated[bool, "웹 검색 비활성화 여부 (평가 시 true 권장)"]
+    disable_relevance_check: Annotated[bool, "relevance_check 노드 비활성화 여부 (평가 시 true 권장)"]
 
 
 # ============================================================
@@ -242,12 +267,13 @@ def _init_chat_model():
     else:
         llm = HuggingFaceEndpoint(
             repo_id=ROUTER_MODEL,
+            provider=HF_PROVIDER,
             task="text-generation",
             temperature=0.7,
             max_new_tokens=1024,
         )
         _chat_hf = ChatHuggingFace(llm=llm)
-        _log(f"✅ 라우팅 LLM 로드 완료 (API): {ROUTER_MODEL}")
+        _log(f"✅ 라우팅 LLM 로드 완료 (API): {ROUTER_MODEL} [provider={HF_PROVIDER}]")
 
 
 def _init_embeddings():
@@ -288,13 +314,15 @@ def _init_peft_model():
     quant = os.getenv("LLM_QUANT", "8bit").lower()
     # GPU 메모리 부족 시 CPU 오프로드 허용 (VRAM 작을 때)
     enable_cpu_offload = os.getenv("LLM_CPU_OFFLOAD", "").lower() in ("1", "true", "yes")
+    # 3090(24GB)에서 14B 4bit 로딩 시 마지막 materialize 단계 OOM 방지를 위해 float16 기본
+    model_dtype = torch.float16 if quant == "4bit" else torch.bfloat16
 
     # 양자화 config
     if quant == "4bit":
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=model_dtype,
             bnb_4bit_use_double_quant=True,
         )
         _log("🔧 4bit 양자화 활성 (OOM 대비)")
@@ -323,20 +351,23 @@ def _init_peft_model():
     _log(f"🔧 attention 구현: {attn_impl}")
 
     # CPU 오프로드 시 device_map + max_memory로 GPU 한도 지정 후 나머지는 CPU
-    if enable_cpu_offload and quant != "4bit":
-        max_memory = {0: os.getenv("LLM_GPU_MAX_MEMORY", "20GiB"), "cpu": "30GiB"}
-        device_map = "auto"
-        _log(f"🔧 device_map=auto, max_memory={max_memory}")
+    device_map = "auto"
+    if enable_cpu_offload:
+        default_gpu_mem = "18GiB" if quant == "4bit" else "20GiB"
+        max_memory = {
+            0: os.getenv("LLM_GPU_MAX_MEMORY", default_gpu_mem),
+            "cpu": os.getenv("LLM_CPU_MAX_MEMORY", "48GiB"),
+        }
+        _log(f"🔧 CPU 오프로드 활성: device_map=auto, max_memory={max_memory}")
     else:
         max_memory = None
-        device_map = "auto"
 
     model = AutoModelForCausalLM.from_pretrained(
         CHAIN_MODEL,
         quantization_config=bnb_config,
         device_map=device_map,
         max_memory=max_memory,
-        torch_dtype=torch.bfloat16,
+        dtype=model_dtype,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,
     )
@@ -386,7 +417,7 @@ def _init_peft_model():
                 quantization_config=bnb_config,
                 device_map=device_map,
                 max_memory=max_memory,
-                torch_dtype=torch.bfloat16,
+                dtype=model_dtype,
                 attn_implementation=attn_impl,
                 low_cpu_mem_usage=True,
             )
@@ -739,6 +770,7 @@ NO""".strip()
 - 과거 대화에서 찾아야 할 핵심 엔티티를 포함하세요.
 - 불필요한 수식어 없이 검색 친화적으로 작성하세요.
 - 질문에 답하지 말고 검색 쿼리 문장만 출력하세요.
+- 출력 언어는 원문 질문의 언어를 유지하세요.
 
 [Recent Chat]
 {recent_chat}
@@ -763,7 +795,9 @@ NO""".strip()
         rewrite_prompt = f"""You are a query rewriter.
 Rewrite the user's question to be clear and standalone.
 Use retrieved long-term context if available. If not available, use only recent chat.
-Do not answer. Return only one rewritten question in Korean.
+Do not answer.
+Preserve the language of the original user question.
+Return only one rewritten question.
 
 [Recent Chat]
 {recent_chat}
@@ -879,7 +913,7 @@ def llm_answer(state: GraphState) -> GraphState:
         history_block = ""
 
     prompt = f"""<|im_start|>system
-You are a helpful tutor. Use the context below only to inform your answer. Do not repeat or output the words "system", "Context:", "Policy:", "History:", "user", "assistant" or any URLs. Reply only with the assistant's answer in natural language.
+You are a helpful tutor. Use the context below only to inform your answer. Do not repeat or output the words "system", "Context:", "Policy:", "History:", "user", "assistant" or any URLs. Reply only with the assistant's answer in natural language. Preserve the language of the user's latest question.
 {history_block}Context: {context}
 Policy: {policy}
 <|im_end|>
@@ -914,6 +948,10 @@ def relevance_check(state: GraphState) -> GraphState:
     검색된 문서(context)가 질문과 관련 있는지 _chat_hf 로 평가.
     결과를 state['relevance'] = 'yes' | 'no' 로 저장.
     """
+    if state.get("disable_relevance_check"):
+        _log("⏭️ relevance_check 비활성화됨: yes로 통과")
+        return {"relevance": "yes"}
+
     prompt = f"""You are a grader assessing whether a retrieved document is relevant to the given question.
 Return ONLY valid JSON like: {{"score": "yes"}} or {{"score": "no"}}.
 
@@ -923,7 +961,11 @@ Question:
 Retrieved document:
 {state["context"]}""".strip()
 
-    text = _invoke_clean(prompt)
+    try:
+        text = _invoke_clean(prompt)
+    except Exception as e:
+        _log(f"⚠️ 관련성 평가 실패: {e} → no")
+        return {"relevance": "no"}
 
     # JSON 부분만 추출 (모델이 앞뒤에 텍스트를 섞는 경우 대비)
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -949,14 +991,18 @@ def web_search(state: GraphState) -> GraphState:
     Tavily API 로 웹 검색 후 결과를 context 에 저장.
     검색 결과는 ChromaDB(my_collection)에도 적재하여 재활용.
     """
+    if state.get("disable_web_search"):
+        _log("🌐 웹 검색 비활성화됨: context 유지 후 진행")
+        return {}
+
     _log("🌐 웹 검색 시작...")
-    tavily = TavilySearch(max_results=5, search_depth="basic")
     query_text = state["question"]
     try:
+        tavily = TavilySearch(max_results=5, search_depth="basic")
         results = tavily.invoke(query_text)
     except Exception as e:
         _log(f"⚠️ 웹 검색 실패: {e}")
-        return GraphState(context="웹 검색 결과를 가져오지 못했습니다.")
+        return {}
 
     # TavilySearch는 버전에 따라 list / dict / str 을 반환할 수 있음
     if isinstance(results, dict):
@@ -965,7 +1011,7 @@ def web_search(state: GraphState) -> GraphState:
         results = [{"content": results}]
     if not isinstance(results, list):
         _log(f"⚠️ 웹 검색 결과 파싱 불가: {type(results)}")
-        return GraphState(context="웹 검색 결과를 가져오지 못했습니다.")
+        return {}
 
     parts = []
     for r in results:
@@ -1146,6 +1192,9 @@ def retrieve_or_not(state: GraphState) -> str:
 
 def is_relevant(state: GraphState) -> str:
     """관련성 평가 결과에 따라 분기"""
+    if state.get("disable_web_search"):
+        _log("🌐 웹 검색 비활성화: web_search 노드 건너뜀")
+        return "relevant"
     return "relevant" if state.get("relevance") == "yes" else "not relevant"
 
 
@@ -1241,6 +1290,8 @@ def query(
     thread_id: str | None = None,
     forced_style: str | None = None,
     variant: str | None = None,
+    disable_web_search: bool | None = None,
+    disable_relevance_check: bool | None = None,
 ) -> Dict[str, Any]:
     """
     질문을 실행하고 최종 GraphState 를 반환.
@@ -1250,6 +1301,8 @@ def query(
         thread_id: 대화 세션 ID (None 이면 자동 생성)
         forced_style: 스타일 강제값 (direct/socratic/scaffolding/feedback), None이면 라우터 사용
         variant: 실행 변형(B0/B1/B2/P), None이면 P
+        disable_web_search: True면 웹 검색 노드를 비활성화
+        disable_relevance_check: True면 relevance_check 노드를 비활성화
 
     Returns:
         최종 상태 딕셔너리 (question, context, answer, messages, relevance)
@@ -1270,6 +1323,8 @@ def query(
         question=question,
         forced_style=normalized_style,
         variant=normalized_variant,
+        disable_web_search=bool(disable_web_search),
+        disable_relevance_check=bool(disable_relevance_check),
     )
 
     # stream 모드로 실행 — 각 노드 완료 시 로그

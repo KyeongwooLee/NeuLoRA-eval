@@ -125,7 +125,9 @@ def run_matrix(
             scores: list[float] = []
 
             for turn in sampled_turns:
+                session_history = session_histories.setdefault(turn.session_id, [])
                 if benchmark in {"comta", "mathdial"} and not turn.reference:
+                    session_history.append(("student", turn.prompt))
                     errors.append(
                         {
                             "session_id": turn.session_id,
@@ -135,9 +137,14 @@ def run_matrix(
                     )
                     continue
 
-                session_history = session_histories.setdefault(turn.session_id, [])
-                retrieval_query = f"{turn.prompt}\n\n{turn.metadata.get('question', '')}".strip()
-                retrieved_docs = corpus.query(retrieval_query, top_k=5)
+                # Avoid double-RAG: backend /api/chat already performs retrieval.
+                # Local Chroma retrieval is only needed for B2 LPITutor path.
+                needs_local_retrieval = config.mode == "architecture" and variant == "B2"
+                if needs_local_retrieval:
+                    retrieval_query = f"{turn.prompt}\n\n{turn.metadata.get('question', '')}".strip()
+                    retrieved_docs = corpus.query(retrieval_query, top_k=5)
+                else:
+                    retrieved_docs = []
 
                 generation = None
                 for _attempt in range(3):
