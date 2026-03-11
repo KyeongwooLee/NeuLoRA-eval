@@ -66,6 +66,7 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     forced_style: str | None = None
     variant: str | None = None
+    router: str | None = None
     disable_web_search: bool | None = None
     disable_relevance_check: bool | None = None
 
@@ -116,12 +117,21 @@ async def chat(req: ChatRequest):
                 "available": list(lg.STYLE_MODELS.keys()),
             },
         )
-    if variant and variant not in {"B0", "B1", "B2", "P"}:
+    if variant and variant not in {"B", "B0", "B1", "B2", "P"}:
         raise HTTPException(
             status_code=400,
             detail={
                 "message": f"Unsupported variant: {variant}",
-                "available": ["B0", "B1", "B2", "P"],
+                "available": ["B", "B0", "B1", "B2", "P"],
+            },
+        )
+    router_mode = (req.router or "").strip().lower() or None
+    if router_mode and router_mode not in {"cent", "mlp"}:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Unsupported router mode: {router_mode}",
+                "available": ["cent", "mlp"],
             },
         )
 
@@ -129,12 +139,13 @@ async def chat(req: ChatRequest):
     try:
         result = await asyncio.to_thread(
             lg.query,
-            req.message,
-            thread_id,
-            forced_style,
-            variant,
-            req.disable_web_search,
-            req.disable_relevance_check,
+            question=req.message,
+            thread_id=thread_id,
+            forced_style=forced_style,
+            variant=variant,
+            router=router_mode,
+            disable_web_search=req.disable_web_search,
+            disable_relevance_check=req.disable_relevance_check,
         )
         logs = lg.get_and_clear_logs()
     except Exception as e:

@@ -9,8 +9,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .common import STYLE_MODELS, EvalConfig, EvalTurn, summarize_history
-from .retrieval import StyleRouter
+try:
+    from .common import STYLE_MODELS, EvalConfig, EvalTurn, summarize_history
+    from .retrieval import StyleRouter
+except ImportError:
+    from common import STYLE_MODELS, EvalConfig, EvalTurn, summarize_history
+    from retrieval import StyleRouter
 
 
 STYLE_PROMPTS: dict[str, str] = {
@@ -56,6 +60,7 @@ class HFChatGenerator:
         thread_id: str,
         forced_style: str | None = None,
         variant: str | None = None,
+        router: str | None = None,
     ) -> str:
         endpoint = f"{self.backend_url}/api/chat"
         payload = {
@@ -63,6 +68,7 @@ class HFChatGenerator:
             "thread_id": thread_id,
             "forced_style": forced_style,
             "variant": variant,
+            "router": router,
             "disable_web_search": self.disable_web_search,
             "disable_relevance_check": self.disable_relevance_check,
         }
@@ -98,6 +104,8 @@ class VariantExecutor:
         self.router = router
         self.seed = seed
         self.random = random.Random(seed)
+        self.router_mode = config.router_mode
+        self.b_vanilla_model_name = os.getenv("B_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
         self.b0_b2_model_name = os.getenv("CHAIN_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
         self._lpitutor = self._load_lpitutor()
 
@@ -165,13 +173,20 @@ class VariantExecutor:
         generated_history: list[tuple[str, str]],
         retrieved_docs: list[dict],
     ) -> GenerationResult:
-        user_prompt = self._build_user_prompt(turn)
+        if variant == "B":
+            user_prompt = turn.prompt
+        else:
+            user_prompt = self._build_user_prompt(turn)
 
         api_thread_id = f"eval-{variant}-{turn.benchmark}-{turn.session_id}"
         api_forced_style: str | None = None
         api_variant = variant
 
-        if variant == "B0":
+        if variant == "B":
+            model_id = self.b_vanilla_model_name
+            style = None
+            api_variant = "B"
+        elif variant == "B0":
             model_id = self.b0_b2_model_name
             style = None
         elif variant == "B1":
@@ -216,6 +231,7 @@ class VariantExecutor:
                         thread_id=api_thread_id,
                         forced_style="scaffolding",
                         variant="B2",
+                        router=self.router_mode,
                     )
                     return GenerationResult(
                         response=(fallback_response or "").strip(),
@@ -233,7 +249,21 @@ class VariantExecutor:
                         error=f"LPITutor path failed: {error}; fallback failed: {fallback_error}",
                     )
         elif variant == "P":
-            style, _ = self.router.route(turn.prompt)
+            merged_history = list(turn.history) + list(generated_history)
+            router_history = [
+                {
+                    "conversation_id": turn.session_id,
+                    "turn_index": idx,
+                    "role": role,
+                    "content": content,
+                }
+                for idx, (role, content) in enumerate(merged_history)
+            ]
+            style, _ = self.router.route(
+                turn.prompt,
+                history=router_history,
+                conversation_id=turn.session_id,
+            )
             model_id = STYLE_MODELS.get(style, STYLE_MODELS["direct"])
             api_variant = "P"
         else:
@@ -245,6 +275,7 @@ class VariantExecutor:
                 thread_id=api_thread_id,
                 forced_style=api_forced_style,
                 variant=api_variant,
+                router=self.router_mode,
             )
             return GenerationResult(
                 response=response,
@@ -281,6 +312,7 @@ class VariantExecutor:
                 thread_id=api_thread_id,
                 forced_style=adapter_style,
                 variant="P",
+                router=self.router_mode,
             )
             return GenerationResult(
                 response=response,

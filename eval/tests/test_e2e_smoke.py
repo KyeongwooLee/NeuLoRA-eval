@@ -43,12 +43,21 @@ class _FakeEmbedder:
 
 
 class _FakeRouter:
-    def __init__(self, router_model_path: Path, embedder: _FakeEmbedder):
+    def __init__(
+        self,
+        router_model_path: Path,
+        embedder: _FakeEmbedder,
+        mode: str = "cent",
+        logger=None,
+    ):
         _ = router_model_path
         _ = embedder
+        _ = mode
+        _ = logger
 
-    def route(self, query: str, default_style: str = "direct"):
+    def route(self, query: str, default_style: str = "direct", **kwargs):
         _ = query
+        _ = kwargs
         return default_style, {default_style: 1.0}
 
 

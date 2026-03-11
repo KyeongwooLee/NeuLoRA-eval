@@ -8,20 +8,37 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from .common import (
-    ADAPTER_VARIANTS,
-    ARCHITECTURE_VARIANTS,
-    BenchmarkData,
-    EvalConfig,
-)
-from .data_loading import load_benchmark, sample_turns
-from .judge import GeminiJudge, gsm8k_exact_match, mean_or_zero
-from .modeling import HFChatGenerator, VariantExecutor
-from .retrieval import ChromaCorpus, EmbeddingBackend, StyleRouter
+try:
+    from .common import (
+        ADAPTER_VARIANTS,
+        ARCHITECTURE_VARIANTS,
+        BenchmarkData,
+        EvalConfig,
+    )
+    from .data_loading import load_benchmark, sample_turns
+    from .judge import GeminiJudge, gsm8k_exact_match, mean_or_zero
+    from .modeling import HFChatGenerator, VariantExecutor
+    from .retrieval import ChromaCorpus, EmbeddingBackend, StyleRouter
+except ImportError:
+    from common import (
+        ADAPTER_VARIANTS,
+        ARCHITECTURE_VARIANTS,
+        BenchmarkData,
+        EvalConfig,
+    )
+    from data_loading import load_benchmark, sample_turns
+    from judge import GeminiJudge, gsm8k_exact_match, mean_or_zero
+    from modeling import HFChatGenerator, VariantExecutor
+    from retrieval import ChromaCorpus, EmbeddingBackend, StyleRouter
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_llm_mode(config: EvalConfig) -> str:
+    mode = (config.llm_mode or os.getenv("LLM_MODE") or "api").strip().lower()
+    return mode if mode in {"api", "vessel"} else "api"
 
 
 def _benchmark_output_path(output_dir: Path, mode: str, benchmark: str, variant: str) -> Path:
@@ -38,7 +55,23 @@ def _variant_list(mode: str) -> list[str]:
         return list(ARCHITECTURE_VARIANTS)
     if mode == "adapters":
         return list(ADAPTER_VARIANTS)
+    if mode == "models":
+        raise ValueError("Use _variant_list_from_config for models mode.")
     raise ValueError(f"Unsupported mode: {mode}")
+
+
+def _variant_list_from_config(config: EvalConfig) -> list[str]:
+    if config.mode == "models":
+        if not config.target_models:
+            raise ValueError("mode=models requires EvalConfig.target_models.")
+        invalid = [token for token in config.target_models if token not in ARCHITECTURE_VARIANTS]
+        if invalid:
+            raise ValueError(
+                f"mode=models supports only architecture variants: {invalid}. "
+                f"Supported: {', '.join(ARCHITECTURE_VARIANTS)}"
+            )
+        return list(config.target_models)
+    return _variant_list(config.mode)
 
 
 def _required_loads(benchmarks: list[str]) -> list[str]:
@@ -60,7 +93,9 @@ def _prepare_corpus_docs(benchmark: str, loaded_data: dict[str, BenchmarkData]) 
     return docs
 
 
-def _build_run_metadata(config: EvalConfig, benchmark: str, variant: str, sample_count: int) -> dict[str, Any]:
+def _build_run_metadata(
+    config: EvalConfig, benchmark: str, variant: str, sample_count: int, llm_mode: str
+) -> dict[str, Any]:
     return {
         "timestamp_utc": _iso_now(),
         "mode": config.mode,
@@ -71,7 +106,8 @@ def _build_run_metadata(config: EvalConfig, benchmark: str, variant: str, sample
         "base_model_name": config.base_model_name,
         "embedding_model_name": config.embedding_model_name,
         "backend_url": config.backend_url,
-        "llm_mode": "api",
+        "router_mode": config.router_mode,
+        "llm_mode": llm_mode,
         "judge_model": config.judge_model,
     }
 
@@ -83,7 +119,8 @@ def run_matrix(
     judge: GeminiJudge | None = None,
 ) -> dict[str, Any]:
     config.ensure_dirs()
-    os.environ["LLM_MODE"] = "api"
+    llm_mode = _resolve_llm_mode(config)
+    os.environ["LLM_MODE"] = llm_mode
 
     if generator is None:
         try:
@@ -98,14 +135,18 @@ def run_matrix(
         judge = GeminiJudge(api_key=config.genai_api_key, model_name=config.judge_model)
 
     embedder = EmbeddingBackend(model_name=config.embedding_model_name)
-    router = StyleRouter(config.project_root / "LangGraph" / "router_model.json", embedder=embedder)
+    router = StyleRouter(
+        config.project_root / "LangGraph" / "router_model.json",
+        embedder=embedder,
+        mode=config.router_mode,
+    )
     executor = VariantExecutor(config=config, generator=generator, router=router, seed=config.seed)
 
     loaded: dict[str, BenchmarkData] = {}
     for benchmark in _required_loads(config.benchmarks):
         loaded[benchmark] = load_benchmark(benchmark, config)
 
-    variants = _variant_list(config.mode)
+    variants = _variant_list_from_config(config)
     run_results: list[dict[str, Any]] = []
 
     for benchmark in config.benchmarks:
@@ -143,7 +184,7 @@ def run_matrix(
 
                 # Avoid double-RAG: backend /api/chat already performs retrieval.
                 # Local Chroma retrieval is only needed for B2 LPITutor path.
-                needs_local_retrieval = config.mode == "architecture" and variant == "B2"
+                needs_local_retrieval = config.mode in {"architecture", "models"} and variant == "B2"
                 if needs_local_retrieval:
                     retrieval_query = f"{turn.prompt}\n\n{turn.metadata.get('question', '')}".strip()
                     retrieved_docs = corpus.query(retrieval_query, top_k=5)
@@ -152,7 +193,7 @@ def run_matrix(
 
                 generation = None
                 for _attempt in range(3):
-                    if config.mode == "architecture":
+                    if config.mode in {"architecture", "models"}:
                         generation = executor.run_architecture_turn(
                             variant=variant,
                             turn=turn,
@@ -253,6 +294,7 @@ def run_matrix(
                     benchmark=benchmark,
                     variant=variant,
                     sample_count=len(items),
+                    llm_mode=llm_mode,
                 ),
                 "notes": benchmark_data.notes,
                 "aggregate": {
@@ -311,7 +353,8 @@ def run_matrix(
             "base_model_name": config.base_model_name,
             "embedding_model_name": config.embedding_model_name,
             "backend_url": config.backend_url,
-            "llm_mode": "api",
+            "router_mode": config.router_mode,
+            "llm_mode": llm_mode,
         },
         "runs": run_results,
         "macro_by_variant": macro_by_variant,

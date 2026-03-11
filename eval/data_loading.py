@@ -8,7 +8,10 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
-from .common import BenchmarkData, EvalConfig, EvalTurn
+try:
+    from .common import BenchmarkData, EvalConfig, EvalTurn
+except ImportError:
+    from common import BenchmarkData, EvalConfig, EvalTurn
 
 
 MATHDIAL_TRAIN_URL = "https://raw.githubusercontent.com/eth-nlped/mathdial/main/data/train.jsonl"

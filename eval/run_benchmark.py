@@ -5,10 +5,24 @@ import json
 from pathlib import Path
 
 try:
-    from .common import MODE_CHOICES, EvalConfig, parse_benchmarks
+    from .common import (
+        LLM_MODE_CHOICES,
+        MODE_CHOICES,
+        ROUTER_MODE_CHOICES,
+        EvalConfig,
+        parse_benchmarks,
+        parse_models,
+    )
     from .runner import run_matrix
 except ImportError:  # pragma: no cover - direct script execution fallback
-    from common import MODE_CHOICES, EvalConfig, parse_benchmarks
+    from common import (
+        LLM_MODE_CHOICES,
+        MODE_CHOICES,
+        ROUTER_MODE_CHOICES,
+        EvalConfig,
+        parse_benchmarks,
+        parse_models,
+    )
     from runner import run_matrix
 
 
@@ -30,21 +44,48 @@ def parse_args() -> argparse.Namespace:
         default="http://127.0.0.1:8800",
         help="NeuLoRA backend URL for /api/chat generation.",
     )
+    parser.add_argument(
+        "--llm-mode",
+        type=str,
+        choices=LLM_MODE_CHOICES,
+        default=None,
+        help="Override LLM_MODE env for eval metadata/runtime propagation (api or vessel).",
+    )
+    parser.add_argument(
+        "--router",
+        type=str,
+        choices=ROUTER_MODE_CHOICES,
+        default="cent",
+        help="Style router mode: cent (centroid cosine) or mlp (2-layer classifier).",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="Comma-separated architecture variants for --mode=models. Supported: B,B0,B1,B2,P",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "outputs")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config = EvalConfig(
+    config_kwargs = dict(
         mode=args.mode,
         benchmarks=parse_benchmarks(args.benchmarks),
         max_samples=args.max_samples,
         seed=args.seed,
         judge_model=args.judge_model,
         backend_url=args.backend_url,
+        router_mode=args.router,
         output_dir=args.output_dir,
+        target_models=parse_models(args.models),
     )
+    if args.mode == "models" and not config_kwargs["target_models"]:
+        raise ValueError("--mode=models requires --models with at least one model ID.")
+    if args.llm_mode:
+        config_kwargs["llm_mode"] = args.llm_mode
+    config = EvalConfig(**config_kwargs)
 
     summary = run_matrix(config)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

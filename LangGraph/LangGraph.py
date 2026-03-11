@@ -32,7 +32,6 @@ import time
 import json
 import re
 import uuid
-import numpy as np
 import requests
 from pathlib import Path
 from datetime import datetime, timezone
@@ -113,6 +112,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")  # 임베딩 
 HF_PROVIDER = (os.getenv("HF_PROVIDER") or "auto").strip().lower() or "auto"
 B0_MODEL = os.getenv("B0_MODEL_NAME", "Qwen/Qwen2.5-14B-Instruct")
 B0_MAX_NEW_TOKENS = 384
+ROUTER_MODE_DEFAULT = (os.getenv("ROUTER_MODE") or "cent").strip().lower() or "cent"
 
 STYLE_MODELS = {
     "direct": "RiverWon/NeuLoRA-direct",
@@ -158,6 +158,7 @@ from rag.ingest import ingest_documents as _raw_ingest_docs
 from rag.ingest import ingest_pdfs as _raw_ingest_pdfs
 from rag.utils import format_docs
 from rag.graph_utils import random_uuid  # 세션 ID 생성용 (re-export)
+from eval.retrieval import StyleRouter
 
 # ============================================================
 # 6. GraphState 정의
@@ -173,10 +174,12 @@ class GraphState(TypedDict):
     messages: Annotated[list, add_messages]  # 대화 이력 (누적)
     relevance: Annotated[str, "검색 문서 관련성 yes/no"]
     policy: Annotated[str, "학생에 대한 답안 방향성"]
-    variant: Annotated[str, "평가/실행 변형(B0/B1/B2/P), 기본 P"]
+    variant: Annotated[str, "평가/실행 변형(B/B0/B1/B2/P), 기본 P"]
     forced_style: Annotated[str, "요청 단위 강제 스타일(선택): direct/socratic/scaffolding/feedback"]
+    router_mode: Annotated[str, "라우터 모드: cent | mlp"]
+    conversation_id: Annotated[str, "현재 대화 ID (thread_id)"]
     applied_style: Annotated[str, "이번 응답에 실제 적용된 스타일"]
-    style_source: Annotated[str, "스타일 결정 출처: router | forced | forced_invalid_fallback"]
+    style_source: Annotated[str, "스타일 결정 출처: router | forced | forced_invalid_fallback | variant_b | variant_b0 | variant_b2"]
     adapter_switched: Annotated[bool, "PEFT set_adapter 적용 성공 여부"]
     disable_web_search: Annotated[bool, "웹 검색 비활성화 여부 (평가 시 true 권장)"]
     disable_relevance_check: Annotated[bool, "relevance_check 노드 비활성화 여부 (평가 시 true 권장)"]
@@ -192,8 +195,10 @@ _use_peft_adapters = False  # True: set_adapter() 사용 / False: 단일 전체 
 _retriever = None  # ChromaDB 기반 retriever
 _chain = None  # RAG 답변 체인
 _chat_hf = None  # 라우팅·판단·요약용 LLM
-_chat_hf_b0 = None  # B0 답변 생성용 LLM (14B, no adapter)
+_chat_hf_b0 = None  # B/B0 답변 생성용 LLM (14B, no adapter)
 _embeddings = None  # 임베딩 모델 인스턴스
+_style_router = None  # style router cache
+_style_router_mode = None  # cached mode
 _app = None  # 컴파일된 LangGraph 앱
 _initialized = False  # 초기화 완료 플래그
 _answer_model_used: str | None = None  # 실제 체인 생성에 사용된 답변 모델명
@@ -457,39 +462,71 @@ def _init_peft_model():
     _rag_llm = HuggingFacePipeline(pipeline=pipe)
     torch.cuda.empty_cache()
 
-def route_style(question: str) -> str:
-    """쿼리를 임베딩하고 가장 가까운 스타일 centroid 선택"""
-    if not LORA_ROUTER_PATH.exists():
-        _log("⚠️ router_model.json 없음 → direct 기본")
-        return "direct"
-    
-    try:
-        with open(LORA_ROUTER_PATH, "r") as f:
-            data = json.load(f)
-        centroids = {
-            style: np.array(vec, dtype=np.float32)
-            for style, vec in data.get("centroids", {}).items()
-        }
-    except Exception as e:
-        _log(f"⚠️ centroids 로드 실패: {e}")
-        return "direct"
-    
-    if not centroids or _embeddings is None:
-        return "direct"
-    
-    query_emb = np.array(_embeddings.embed_query(question), dtype=np.float32)
-    
-    best_style, best_sim = "direct", -1.0
-    for style, centroid in centroids.items():
-        sim = np.dot(query_emb, centroid) / (
-            np.linalg.norm(query_emb) * np.linalg.norm(centroid) + 1e-9
+class _LangGraphEmbedderAdapter:
+    def encode_one(self, text: str) -> list[float]:
+        if _embeddings is None:
+            return []
+        try:
+            vector = _embeddings.embed_query(text)
+            return [float(v) for v in vector]
+        except Exception:
+            return []
+
+
+def _resolve_router_mode(router_mode: str | None) -> str:
+    mode = (router_mode or ROUTER_MODE_DEFAULT).strip().lower()
+    return mode if mode in {"cent", "mlp"} else "cent"
+
+
+def _get_style_router(router_mode: str) -> StyleRouter:
+    global _style_router, _style_router_mode
+    mode = _resolve_router_mode(router_mode)
+    if _style_router is not None and _style_router_mode == mode:
+        return _style_router
+    _style_router = StyleRouter(
+        LORA_ROUTER_PATH,
+        embedder=_LangGraphEmbedderAdapter(),
+        mode=mode,
+        logger=None,
+    )
+    _style_router_mode = mode
+    return _style_router
+
+
+def route_style(
+    question: str,
+    *,
+    messages: list | None = None,
+    conversation_id: str | None = None,
+    router_mode: str | None = None,
+) -> str:
+    mode = _resolve_router_mode(router_mode)
+    history: list[dict] = []
+    conv = str(conversation_id or "").strip()
+    conversation = _conversation_only(messages or [])
+    for idx, item in enumerate(conversation):
+        role, content = item
+        history.append(
+            {
+                "conversation_id": conv,
+                "turn_index": idx,
+                "role": role,
+                "content": content,
+            }
         )
-        if sim > best_sim:
-            best_sim = sim
-            best_style = style
-    
-    _log(f"📊 centroids 유사도: {best_style}={best_sim:.3f}")
-    return best_style
+
+    router = _get_style_router(mode)
+    selected, scores = router.route(
+        question,
+        history=history,
+        conversation_id=conv,
+    )
+    top_score = float(scores.get(selected, 0.0))
+    if mode == "mlp":
+        _log(f"📊 router({mode}) 선택: {selected}")
+    else:
+        _log(f"📊 router({mode}) 선택: {selected}={top_score:.3f}")
+    return selected
 
 def initialize(
     persist_directory: str = PERSIST_DIR,
@@ -733,6 +770,10 @@ def contextualize(state: GraphState) -> GraphState:
     """
     messages = state.get("messages", [])
     question = _extract_question(state.get("question", "")).strip()
+    variant = (state.get("variant") or "P").strip().upper()
+    if variant == "B":
+        # B variant is pure vanilla generation: skip all rewrite/classification steps.
+        return GraphState(question=question)
     # 최근 대화 10 메시지를 텍스트로 변환
     recent_chat = "\n".join(_to_text(m) for m in messages[-10:])
 
@@ -881,6 +922,8 @@ def llm_answer(state: GraphState) -> GraphState:
     policy = state.get("policy", "")
     variant = (state.get("variant") or "P").strip().upper()
     forced_style = (state.get("forced_style") or "").strip().lower()
+    router_mode = _resolve_router_mode(state.get("router_mode"))
+    conversation_id = str(state.get("conversation_id") or "")
 
     if forced_style:
         if forced_style in STYLE_MODELS:
@@ -891,6 +934,10 @@ def llm_answer(state: GraphState) -> GraphState:
             style = "direct"
             style_source = "forced_invalid_fallback"
             _log(f"⚠️ 잘못된 forced_style='{forced_style}' → direct 사용")
+    elif variant == "B":
+        style = "vanilla"
+        style_source = "variant_b"
+        _log("🎯 B: vanilla Qwen-2.5-14B direct generation")
     elif variant == "B0":
         style = "direct"
         style_source = "variant_b0"
@@ -900,14 +947,19 @@ def llm_answer(state: GraphState) -> GraphState:
         style_source = "variant_b2"
         _log("🎯 B2: intermediate/scaffolding 고정")
     else:
-        style = route_style(question)  # centroids → direct/socratic/scaffolding/feedback
+        style = route_style(
+            question,
+            messages=chat_history,
+            conversation_id=conversation_id,
+            router_mode=router_mode,
+        )
         style_source = "router"
         _log(f"🎯 LoRA 라우팅: {style}")
 
     adapter_switched = False
-    # B0는 어댑터 스위칭을 하지 않음.
+    # B/B0는 어댑터 스위칭을 하지 않음.
     # PEFT 멀티 어댑터일 때만 쿼리별 어댑터 스위칭 (전체 모델 단일 로드 시 무시)
-    if variant != "B0" and _peft_model is not None:
+    if variant not in {"B", "B0"} and _peft_model is not None:
         try:
             _peft_model.set_adapter(style)
             adapter_switched = True
@@ -921,13 +973,16 @@ def llm_answer(state: GraphState) -> GraphState:
                 adapter_switched = False
                 _log(f"❌ direct 어댑터 적용도 실패: {e2}")
 
-    history_str = _format_chat_history_for_prompt(chat_history)
-    if history_str:
-        history_block = f"History:\n{history_str}\n\n"
-    else:
-        history_block = ""
-
-    prompt = f"""<|im_start|>system
+    try:
+        if variant == "B":
+            response = _invoke_clean(question, chat_model=_chat_hf_b0 or _chat_hf).strip()
+        elif variant == "B0":
+            history_str = _format_chat_history_for_prompt(chat_history)
+            if history_str:
+                history_block = f"History:\n{history_str}\n\n"
+            else:
+                history_block = ""
+            prompt = f"""<|im_start|>system
 You are a helpful tutor. Use the context below only to inform your answer. Do not repeat or output the words "system", "Context:", "Policy:", "History:", "user", "assistant" or any URLs. Reply only with the assistant's answer in natural language. Preserve the language of the user's latest question.
 {history_block}Context: {context}
 Policy: {policy}
@@ -936,10 +991,22 @@ Policy: {policy}
 {question}<|im_end|>
 <|im_start|>assistant
     """
-    try:
-        if variant == "B0":
             response = _invoke_clean(prompt, chat_model=_chat_hf_b0 or _chat_hf).strip()
         else:
+            history_str = _format_chat_history_for_prompt(chat_history)
+            if history_str:
+                history_block = f"History:\n{history_str}\n\n"
+            else:
+                history_block = ""
+            prompt = f"""<|im_start|>system
+You are a helpful tutor. Use the context below only to inform your answer. Do not repeat or output the words "system", "Context:", "Policy:", "History:", "user", "assistant" or any URLs. Reply only with the assistant's answer in natural language. Preserve the language of the user's latest question.
+{history_block}Context: {context}
+Policy: {policy}
+<|im_end|>
+<|im_start|>user
+{question}<|im_end|>
+<|im_start|>assistant
+    """
             response = _rag_llm.invoke(prompt).strip()
         response = _clean_answer_for_display(response)
     except Exception as e:
@@ -1175,6 +1242,9 @@ def retrieve_or_not(state: GraphState) -> str:
     - 검색 필요   → "retrieve"     → retrieve 노드
     """
     question = state.get("question", "")
+    variant = (state.get("variant") or "P").strip().upper()
+    if variant == "B":
+        return "not retrieve"
     if not question:
         return "not retrieve"
 
@@ -1215,6 +1285,9 @@ def is_relevant(state: GraphState) -> str:
 
 def save_or_not(state: GraphState) -> str:
     """대화가 10턴 단위(20 메시지)일 때 save_memory 로 분기하여 policy 갱신"""
+    variant = (state.get("variant") or "P").strip().upper()
+    if variant == "B":
+        return "too short"
     conv = _conversation_only(state.get("messages", []))
     turn_count = len(conv) // 2
     if turn_count > 0 and turn_count % 10 == 0:
@@ -1305,6 +1378,7 @@ def query(
     thread_id: str | None = None,
     forced_style: str | None = None,
     variant: str | None = None,
+    router: str | None = None,
     disable_web_search: bool | None = None,
     disable_relevance_check: bool | None = None,
 ) -> Dict[str, Any]:
@@ -1315,7 +1389,8 @@ def query(
         question:  사용자 질문 문자열
         thread_id: 대화 세션 ID (None 이면 자동 생성)
         forced_style: 스타일 강제값 (direct/socratic/scaffolding/feedback), None이면 라우터 사용
-        variant: 실행 변형(B0/B1/B2/P), None이면 P
+        variant: 실행 변형(B/B0/B1/B2/P), None이면 P
+        router: 라우터 모드(cent/mlp), None이면 ROUTER_MODE 또는 cent
         disable_web_search: True면 웹 검색 노드를 비활성화
         disable_relevance_check: True면 relevance_check 노드를 비활성화
 
@@ -1334,10 +1409,13 @@ def query(
     )
     normalized_style = (forced_style or "").strip().lower() or None
     normalized_variant = (variant or "P").strip().upper()
+    normalized_router = _resolve_router_mode(router)
     inputs = GraphState(
         question=question,
         forced_style=normalized_style,
         variant=normalized_variant,
+        router_mode=normalized_router,
+        conversation_id=thread_id,
         disable_web_search=bool(disable_web_search),
         disable_relevance_check=bool(disable_relevance_check),
     )
@@ -1376,24 +1454,31 @@ def verify_chain_and_lora_config() -> Dict[str, Any]:
         result["ok"] = False
         result["errors"].append("STYLE_MODELS에 'direct'가 없음")
 
-    # 2) router_model.json 존재 및 centroids 키와 STYLE_MODELS 일치
+    # 2) router_model.json 존재 및 (centroids 키 또는 classifier labels)와 STYLE_MODELS 일치
     if not LORA_ROUTER_PATH.exists():
         result["checks"]["router_file"] = "없음 (route_style은 direct 반환)"
     else:
         try:
             with open(LORA_ROUTER_PATH, "r") as f:
                 data = json.load(f)
-            centroids = data.get("centroids") or data.get("styles", [])
-            if isinstance(centroids, dict):
-                centroid_keys = set(centroids.keys())
+            classifier = data.get("classifier") or {}
+            labels = classifier.get("labels") if isinstance(classifier, dict) else None
+            if isinstance(labels, list) and labels:
+                router_keys = {str(label) for label in labels}
+                result["checks"]["router_mode_info"] = "classifier.labels 사용"
             else:
-                centroid_keys = set(centroids) if isinstance(centroids, list) else set()
-            result["checks"]["centroid_keys"] = list(centroid_keys)
-            missing_in_router = style_keys - centroid_keys
+                centroids = data.get("centroids") or data.get("styles", [])
+                if isinstance(centroids, dict):
+                    router_keys = set(centroids.keys())
+                else:
+                    router_keys = set(centroids) if isinstance(centroids, list) else set()
+                result["checks"]["router_mode_info"] = "centroids/styles 사용"
+            result["checks"]["router_style_keys"] = list(router_keys)
+            missing_in_router = style_keys - router_keys
             if missing_in_router:
                 result["ok"] = False
                 result["errors"].append(f"router_model에 없는 스타일: {missing_in_router}")
-            extra = centroid_keys - style_keys
+            extra = router_keys - style_keys
             if extra:
                 result["checks"]["extra_in_router"] = list(extra)
         except Exception as e:
